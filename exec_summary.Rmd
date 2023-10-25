@@ -1,0 +1,198 @@
+---
+title: "Executive Summary: EDA and Modeling"
+author: "Anthony Kim"
+date: "March 17, 2021"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    highlight: "tango"
+    code_folding: hide
+---
+
+## Summary
+
+The goal of this project is to explore the question: "What characteristics make a song popular?". I used a Spotify Track dataset, which contains over 100,000 songs collected from Spotify's Web API (https://developer.spotify.com/) and includes information on various track features.
+
+I began with an exploratory data analysis of the dataset in order to explore the outcome variable, `popularity`, and its relationship with several predictor variables. Through the exploratory data analysis, I identified several interesting features of the dataset. Most notably, I found that the year of the track appeared to have a fairly signficant relationship with popularity.
+
+```{r, echo=FALSE, message=FALSE}
+# Load packages
+library(tidyverse)
+library(tidymodels)
+
+# Set seed
+set.seed(123)
+
+# Load the data
+music <- read_rds("data/processed/music.rds")
+```
+```{r}
+# Plot the density of year split by the 50th percentile of 'popularity'
+music %>%
+  ggplot(aes(x = year, color = popularity > median(popularity))) +
+  geom_density()
+```
+
+After the EDA, I split the data into training and test sets and created folds using V-fold cross-validation resampling using five folds and three repeats. Then I created a recipe to predict `popularity` using `acousticness`, `danceability`, `energy`, `instrumentalness`, `liveness`, `loudness`, `speechiness`, `tempo`, `valence`, `year`, `mode`, and `explicit`. This recipe will be used for four different models--an elastic net model, a random forest model, a boosted tree model, and a nearest neighbors model--that will compete based on the RMSE performance metric.
+
+```{r, echo=FALSE}
+# Split the data
+music_split <- initial_split(music, prop = 0.7, strata = popularity)
+
+# Create training and test sets
+music_train <- training(music_split)
+music_test <- testing(music_split)
+
+# Create folds in the training data
+music_folds <- vfold_cv(music_train, v = 5, repeats = 3)
+```
+```{r}
+# Create a recipe for the data
+music_rec <- recipe(popularity ~ acousticness + danceability + energy + 
+                      instrumentalness + liveness + loudness + speechiness + 
+                      tempo + valence + year + mode + explicit, 
+                    data = music_train) %>%
+  step_dummy(acousticness, instrumentalness, liveness, speechiness, mode, 
+             explicit) %>%
+  step_normalize(all_predictors())
+
+# Prep and bake the recipe
+prep(music_rec) %>%
+  bake(new_data = NULL)
+```
+
+With my tuned models, I evaluated the performance of each to determine the optimal parameters and the "winning" model. I use RMSE as our performance metric. To determine the winning model, I use an autoplot for each of the models to visualize the performance of each of the combinations of parameters. Below are the results.
+
+```{r, echo=FALSE}
+# Create an elastic model
+elastic_model <- linear_reg(penalty = tune(),
+                            mixture = tune()) %>%
+  set_engine("glmnet")
+
+# Create a random forest model
+rf_model <- rand_forest(mode = "regression",
+                        mtry = tune(),
+                        min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity")
+
+# Create a boosted tree model
+bt_model <- boost_tree(mode = "regression",
+                       mtry = tune(),
+                       min_n = tune(),
+                       learn_rate = tune()) %>%
+  set_engine("xgboost")
+
+# Create a nearest neighbors model
+nn_model <- nearest_neighbor(mode = "regression",
+                             neighbors = tune()) %>%
+  set_engine("kknn")
+
+# Set up parameters for elastic model
+elastic_params <- parameters(elastic_model)
+
+# Set up a regular grid with 5 levels for elastic model
+elastic_grid <- grid_regular(elastic_params, levels = 5)
+
+# Set up parameters for random forest model
+rf_params <- parameters(rf_model) %>%
+  update(mtry = mtry(range = c(1, 6)))
+
+# Set up a regular grid with 5 levels for random forest model
+rf_grid <- grid_regular(rf_params, levels = 5)
+
+# Set up parameters for boosted tree model
+bt_params <- parameters(bt_model) %>%
+  update(mtry = mtry(range = c(1, 6)),
+         learn_rate = learn_rate(range = c(-5, -0.2)))
+
+# Set up a regular grid with 4 levels for boosted tree model
+bt_grid <- grid_regular(bt_params, levels = 5)
+
+# Set up parameters for nearest neighbors model
+nn_params <- parameters(nn_model)
+
+# Set up a regular grid with 5 levels for nearest neighbors model
+nn_grid <- grid_regular(nn_params, levels = 5)
+
+# Define an elastic workflow
+elastic_workflow <- workflow() %>%
+  add_model(elastic_model) %>%
+  add_recipe(music_rec)
+
+# Define a random forest workflow
+rf_workflow <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(music_rec)
+
+# Define a boosted tree workflow
+bt_workflow <- workflow() %>%
+  add_model(bt_model) %>%
+  add_recipe(music_rec)
+
+# Define a nearest neighbors workflow
+nn_workflow <- workflow() %>%
+  add_model(nn_model) %>%
+  add_recipe(music_rec)
+
+# Code here has been implemented to obtain the results quickly and so that we 
+# don't have to wait for the tuning
+load("model_info/elastic_tuned.rda")
+load("model_info/rf_tuned.rda")
+load("model_info/bt_tuned.rda")
+load("model_info/nn_tuned.rda")
+```
+
+**Elastic Net Model:**
+```{r}
+# Plot the RMSE of the elastic model
+autoplot(elastic_tuned, metric = "rmse")
+```
+
+**Random Forest Model:**
+```{r}
+# Plot the RMSE of the random forest model
+autoplot(rf_tuned, metric = "rmse")
+```
+
+**Boosted Tree Model:**
+```{r}
+# Plot the RMSE of the boosted tree model
+autoplot(bt_tuned, metric = "rmse")
+```
+
+**Nearest Neighbors Model:**
+```{r}
+# Plot the RMSE of the nearest neighbors model
+autoplot(nn_tuned, metric = "rmse")
+```
+
+I identified the random forest model as the best-performing model, as illustrated in the autoplot of the different models of combinations of parameters. I apply the random forest model to the entire training data set this time and then use a variable importance plot to visualize the most significant predictors in my model. The variable importance plot illustrates that the most important variable in the model was `year` with `loudness` and `energy` following next. 
+
+```{r}
+# Define a workflow for the winning model
+final_workflow <- rf_workflow %>%
+  finalize_workflow(select_best(rf_tuned, metric = "rmse"))
+
+# Fit the model to the entire training set
+final_results <- fit(final_workflow, music_train)
+
+# Visualize a variable importance plot
+final_results %>%
+  pull_workflow_fit() %>%
+  vip::vip()
+```
+
+Finally, I apply the winning random forest model to the test data.
+
+```{r}
+# Define a performance metric set
+popularity_metric <- metric_set(rmse, rsq)
+
+# Apply the model to the test set and obtain results
+predict(final_results, new_data = music_test %>% select(-popularity)) %>%
+  bind_cols(music_test %>% select(popularity)) %>%
+  popularity_metric(truth = popularity, estimate = .pred)
+```
+
+The random forest model applied to the testing data achieves an RMSE value of 11.7 and an R^2^ value of 0.554. These results are very similar to those found in the training data, and in fact only off by 0.1 in the RMSE metric. This suggests that the model did not overfit the training data. While the model did not fit the data as closely as I had hoped, since I am predicting something as subjective as popularity (which stems from the diverse tastes and preferences of a wide audience), I am quite happy with the results.

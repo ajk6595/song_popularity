@@ -1,0 +1,448 @@
+---
+title: "Long Report: EDA and Modeling"
+author: "Anthony Kim"
+date: "March 17, 2021"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    highlight: "tango"
+    code_folding: hide
+---
+
+## Part I: Introduction and Overview
+
+The goal of this project is to explore the question: "What characteristics make a song popular?". This is a predictive question because I am interested in seeing what factors affect song popularity. As a music enthusiast, I love discovering new songs and have always been curious as to what elements of a song make it more popular among a wide audience. Moreover, with Spotify having established itself as a major digital music streaming platform, its user listening data, as well as track data, provide a fresh insight into the listening preferences of music lovers around the world, in the sense of identifying favorable track features. In this project, I use a regression-based approach, where popularity would be the outcome variable. 
+
+<br>
+
+## Part II: Datasets and Packages
+
+I will be using a Spotify Track dataset, which contains over 100,000 songs collected from Spotify's Web API (https://developer.spotify.com/) and includes information on song id, name, artists, acousticness, danceability, energy, duration, instrumentalness, valence, popularity, tempo, liveness, loudness, speechiness, year, mode, explicit, and key. The dataset is found on Kaggle (https://www.kaggle.com/yamaerenay/spotify-dataset-19212020-160k-tracks), though it is possible to scrape the data from Spotify's Web API directly.
+
+I start by loading the `tidyverse` and `tidymodels` packages, setting a seed to ensure my work is replicatable, and importing the data.
+
+```{r, message=FALSE}
+# Load packages
+library(tidyverse)
+library(tidymodels)
+
+# Set seed
+set.seed(123)
+
+# Load the data
+music <- read_rds("data/processed/music.rds")
+```
+
+*Note: When cleaning the dataset, I removed songs with `popularity` values less than five because the vast majority of these songs come from recently posted tracks, which are "unpopular" not because of the characteristics of the track but rather because listeners have not discovered it yet. I also converted several continuous variables into dummy variables given that they were a confidence measure of whether or not a track had a certain element or characteristic. Finally, I modified the scale of certain measurements to make them easier to interpret.*
+
+<br>
+
+## Part III: Exploratory Data Analysis
+
+To begin my exploratory data analysis, I skim the overall dataset to examine the variable types and basic statistics. Everything looks relatively as expected, so I proceed with the analysis.
+
+```{r}
+# Skim the overall dataset
+skimr::skim_without_charts(music)
+```
+
+I plot the density of the outcome variable `popularity`. It appears somewhat right skewed, but not too significantly. There appears to be a peak of songs around a popularity value of 30 and slim tail of songs with high popularity.
+
+```{r}
+# Plot the density of the outcome variable 'popularity'
+music %>%
+  ggplot(aes(x = popularity)) +
+  geom_density()
+```
+
+I am curious to see how the year of the song affects popularity, so I first plot the density of year split by the median popularity. As illustrated, it seems most of more popular songs are from more recent years, whereas less popular songs come from older times.
+
+```{r}
+# Plot the density of year split by the 50th percentile of 'popularity'
+music %>%
+  ggplot(aes(x = year, color = popularity > median(popularity))) +
+  geom_density()
+```
+
+Moreover, the overall trend of popularity over the years seems to increase over time. Intuitively, this trend makes sense because songs that are released today more closely reflect the tastes and preferences of the present-day listener.
+
+```{r, message=FALSE}
+# Graph the mean popularity per year over time
+music %>%
+  group_by(year) %>%
+  summarise(
+    average_popularity = mean(popularity)
+  ) %>%
+  ggplot(aes(x = year, y = average_popularity)) +
+  geom_line()
+```
+
+Next, I want to examine the relationship between the loudness and energy of a song, as well as both of these characterstics' relationship with popularity. The scatterplot illustrates a fairly clear positive trend between `loudness` and `energy`. Moreover, it roughly appears that more popular songs are louder and more energetic.
+
+```{r, message=FALSE}
+# Visualize a scatterplot of 'loudness' and 'energy' split between high and low popularities
+music %>%
+  ggplot(aes(x = loudness, y = energy)) +
+  geom_point(aes(color = popularity > median(popularity)), alpha = 0.1) +
+  geom_smooth()
+```
+
+I also examine the relationship between `danceability` and `popularity`. The scatterplot seems to indicate less strong of a relationship between these two variables. However, there does appear to be a slight positive trend between `danceability` and `popularity`.
+
+```{r, message=FALSE}
+# Visualize a scatterplot of 'danceability' and 'popularity'
+music %>%
+  ggplot(aes(x = danceability, y = popularity)) +
+  geom_point(alpha = 0.05) +
+  geom_smooth()
+```
+
+Additionally, I explore the distribution of popularity split between whether or not a track is acoustic or not. It seems as though songs that are not acoustic are generally more popular.
+
+```{r}
+# Display a boxplot of popularity split between whether or not a song is acoustic
+music %>%
+  mutate(
+    acousticness = fct_recode(acousticness,
+                              "acoustic" = "1",
+                              "not acoustic" = "0")
+  ) %>%
+  ggplot(aes(x = acousticness, y = popularity)) +
+  geom_boxplot()
+```
+
+Finally, I use a correlation matrix to view the correlations between all of the variables that I plan to include in my recipe when feature engineering. Note that the correlation only represents a linear relationship between the variables. Therefore, there may still exist a different relationship that my later models will hopefully capture.
+
+```{r, message=FALSE}
+# Calculate the correlation coefficients and find highly correlated variables
+corrr::correlate(music %>%
+                   mutate(
+                     acousticness = as.numeric(acousticness),
+                     instrumentalness = as.numeric(instrumentalness),
+                     liveness = as.numeric(liveness),
+                     speechiness = as.numeric(speechiness)
+                   ) %>%
+                   select(popularity,
+                          acousticness,
+                          danceability,
+                          energy,
+                          instrumentalness,
+                          liveness,
+                          loudness,
+                          speechiness,
+                          tempo,
+                          valence,
+                          year))
+```
+
+<br>
+
+## Part IV: Modeling
+
+### A. Data Splitting and Folding
+
+Since the dataset is so large at 123,865 observations, I decided to split the training and test set at a 70% proportion. I also used stratification on the outcome variable `popularity` to ensure that the full range of values is represented in both the training and test sets. Doing so ensures that both the training and test sets resemble the original dataset as closely as possible.
+
+```{r}
+# Split the data
+music_split <- initial_split(music, prop = 0.7, strata = popularity)
+```
+
+**Training and Test Set Dimensions:**
+```{r}
+# Create training and test sets
+music_train <- training(music_split)
+
+# Verify dimensions of each set
+dim(music_train)
+```
+
+<br>
+
+**Test Set Dimensions:**
+```{r}
+# Create training and test sets
+music_test <- testing(music_split)
+
+# Verify dimensions of each set
+dim(music_test)
+```
+
+<br>
+
+After splitting the data, I use V-fold cross-validation with five folds and three repeats. We are resampling the data by partitioning the training data into five different sets of roughly equal size, each of which is used to fit model, and repeating this method three times in order to average the statistics and reduce noise. We use this method rather than simply fitting and testing models on the entire training set because it helps us obtain a better estimate for the model and use the data more efficiently.
+
+```{r}
+# Create folds in the training data
+music_folds <- vfold_cv(music_train, v = 5, repeats = 3)
+```
+
+<br>
+
+### B. Feature Engineering
+
+At this stage, I create a recipe for our different models that we will use. My recipe predicts `popularity` using `acousticness`, `danceability`, `energy`, `instrumentalness`, `liveness`, `loudness`, `speechiness`, `tempo`, `valence`, `year`, `mode`, and `explicit`. Moreover, steps have been added to dummy code the binary variables (those that take a value or 0 or 1 depending on if the track has the characteristic or not) and to center and scale all predictors.
+
+To preview the effect of the recipe, it has also been prepped and baked.
+
+```{r}
+# Create a recipe for the data
+music_rec <- recipe(popularity ~ acousticness + danceability + energy + 
+                      instrumentalness + liveness + loudness + speechiness + 
+                      tempo + valence + year + mode + explicit, 
+                    data = music_train) %>%
+  step_dummy(acousticness, instrumentalness, liveness, speechiness, mode, 
+             explicit) %>%
+  step_normalize(all_predictors())
+
+# Prep and bake the recipe
+prep(music_rec) %>%
+  bake(new_data = NULL)
+```
+
+<br>
+
+### C. Models and Tuning
+
+I have chosen to use four different models: an elastic net model, a random forest model, a boosted tree model, and a nearest neighbors model. These models are set up with proper tuning parameters, as seen in the (hidden) code chunk below.
+
+```{r}
+# Create an elastic model
+elastic_model <- linear_reg(penalty = tune(),
+                            mixture = tune()) %>%
+  set_engine("glmnet")
+
+# Create a random forest model
+rf_model <- rand_forest(mode = "regression",
+                        mtry = tune(),
+                        min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity")
+
+# Create a boosted tree model
+bt_model <- boost_tree(mode = "regression",
+                       mtry = tune(),
+                       min_n = tune(),
+                       learn_rate = tune()) %>%
+  set_engine("xgboost")
+
+# Create a nearest neighbors model
+nn_model <- nearest_neighbor(mode = "regression",
+                             neighbors = tune()) %>%
+  set_engine("kknn")
+```
+
+Then for each of these models, I update the tuning parameters to establish upper and lower limits for the parameters. In particular, I updated the `mtry` parameters so that the upper limit would be 50% of the number of predictors. Moreover, I updated the `learn_rate` parameter to range from $10^{-5}$ to $10^{-0.2}$ or equivalently 0.00001 and to 0.63096. The remaining tuning parameters were left unchanged, as the default ranges seemed fine. 
+
+Afterwards, I set up a tuning grid to create a set of possible combinations of tuning parameter values. All of these combinations will be estimating a model and tested based on the model's average performance across the data folds.
+
+```{r}
+# Set up parameters for elastic model
+elastic_params <- parameters(elastic_model)
+
+# Set up a regular grid with 5 levels for elastic model
+elastic_grid <- grid_regular(elastic_params, levels = 5)
+
+# Set up parameters for random forest model
+rf_params <- parameters(rf_model) %>%
+  update(mtry = mtry(range = c(1, 6)))
+
+# Set up a regular grid with 5 levels for random forest model
+rf_grid <- grid_regular(rf_params, levels = 5)
+
+# Set up parameters for boosted tree model
+bt_params <- parameters(bt_model) %>%
+  update(mtry = mtry(range = c(1, 6)),
+         learn_rate = learn_rate(range = c(-5, -0.2)))
+
+# Set up a regular grid with 4 levels for boosted tree model
+bt_grid <- grid_regular(bt_params, levels = 5)
+
+# Set up parameters for nearest neighbors model
+nn_params <- parameters(nn_model)
+
+# Set up a regular grid with 5 levels for nearest neighbors model
+nn_grid <- grid_regular(nn_params, levels = 5)
+```
+
+After the tuning grids have been set up. I create workflows for each of the four models.
+
+```{r}
+# Define an elastic workflow
+elastic_workflow <- workflow() %>%
+  add_model(elastic_model) %>%
+  add_recipe(music_rec)
+
+# Define a random forest workflow
+rf_workflow <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(music_rec)
+
+# Define a boosted tree workflow
+bt_workflow <- workflow() %>%
+  add_model(bt_model) %>%
+  add_recipe(music_rec)
+
+# Define a nearest neighbors workflow
+nn_workflow <- workflow() %>%
+  add_model(nn_model) %>%
+  add_recipe(music_rec)
+```
+
+Finally, at long last, I tune and fit the four models. Note that the code chunk below is set to `eval=FALSE` and a hidden code chunk is instead loading the .rda results from the `"model_info"` folder. 
+
+```{r, eval=FALSE}
+# Tune the parameters of the elastic model
+elastic_tuned <- elastic_workflow %>%
+  tune_grid(music_folds, grid = elastic_grid)
+
+# Tune the parameters of the random forest model
+rf_tuned <- rf_workflow %>%
+  tune_grid(music_folds, grid = rf_grid)
+
+# Tune the parameters of the boosted tree model
+bt_tuned <- bt_workflow %>%
+  tune_grid(music_folds, grid = bt_grid)
+
+# Tune the parameters of the nearest neighbor model
+nn_tuned <- nn_workflow %>%
+  tune_grid(music_folds, grid = nn_grid)
+```
+```{r, echo=FALSE}
+# Code here has been implemented to obtain the results quickly and so that we 
+# don't have to wait for the tuning
+load("model_info/elastic_tuned.rda")
+load("model_info/rf_tuned.rda")
+load("model_info/bt_tuned.rda")
+load("model_info/nn_tuned.rda")
+```
+
+<br>
+
+### D. Model Assessment
+
+With our tuned models, it's time to evaluate the performance of each to determine the optimal parameters and the "winning" model. I use RMSE as our performance metric. To determine the winning model, I use an autoplot for each of the models to visualize the performance of each of the combinations of parameters, and use the `show_best()` function to determine the RMSE of each. Below are the results.
+
+<br>
+
+#### Elastic Net Model
+
+**The best performing combination of parameters for the elastic net model appears to be a penalty value of 0.000000001 and a mixture value of 0.288. This achieves an RMSE of 13.6.**
+
+```{r}
+# Plot the RMSE of the elastic model
+autoplot(elastic_tuned, metric = "rmse")
+
+# Evaluate the performance of the tuned elastic model
+show_best(elastic_tuned, metric = "rmse")
+```
+
+For low values of penalty, the RMSE does not seem to differ very significantly, even across different mixtures. Overall, lower mixtures appear to perform better.
+
+<br>
+
+#### Random Forest Model
+
+**The best performing combination of parameters for the random forest model appears to be an mtry value of 4 and a min_n value of 2. This achieves an RMSE value of 11.8.**
+
+```{r}
+# Plot the RMSE of the random forest model
+autoplot(rf_tuned, metric = "rmse")
+
+# Evaluate the performance of the tuned random forest model
+show_best(rf_tuned, metric = "rmse")
+```
+
+The performance improves as the minimal node size decreases. Moveover, as the number of randomly selectors increases, the performance generally increases but levels off around four to six predictors.
+
+<br>
+
+#### Boosted Tree Model
+
+**The best performing combination of parameters for the boosted tree model appears to be an mtry value of 1, a min_n value of 21, and a learn_rate of 0.631. This achieves an RMSE of 12.1.**
+
+```{r}
+# Plot the RMSE of the boosted tree model
+autoplot(bt_tuned, metric = "rmse")
+
+# Evaluate the performance of the tuned boosted tree model
+show_best(bt_tuned, metric = "rmse")
+```
+
+As the learn rate increases, the model appears to perform better. The minimal node size does not seem to make a very large difference. Lastly, the number of randomly selected predictors seems to be optimal at a value of one.
+
+<br>
+
+#### Nearest Neighbors Model
+
+**The best performing combination of parameters for the nearest neighbors model appears to be a neighbors value of 15. This achieves an RMSE of 12.8.**
+
+```{r}
+# Plot the RMSE of the nearest neighbors model
+autoplot(nn_tuned, metric = "rmse")
+
+# Evaluate the performance of the tuned nearest neighbor model 
+show_best(nn_tuned, metric = "rmse")
+```
+
+As the number of neighbors increases, the model performs better.
+
+<br>
+
+#### Decision
+
+Based on the RMSE performance metric, the random forest model performs the best out of the models, resulting in an RMSE value of 11.8 with the parameters set to `mtry = 4` and `min_n = 2`. I apply the random forest model to the entire training data set this time and then use a variable importance plot to visualize the most significant predictors in my model.
+
+```{r}
+# Define a workflow for the winning model
+final_workflow <- rf_workflow %>%
+  finalize_workflow(select_best(rf_tuned, metric = "rmse"))
+
+# Fit the model to the entire training set
+final_results <- fit(final_workflow, music_train)
+
+# Visualize a variable importance plot
+final_results %>%
+  pull_workflow_fit() %>%
+  vip::vip()
+```
+
+<br>
+
+#### Performance on Test Set
+
+Finally, I apply the winning random forest model to the test data.
+
+```{r}
+# Define a performance metric set
+popularity_metric <- metric_set(rmse, rsq)
+
+# Apply the model to the test set and obtain results
+predict(final_results, new_data = music_test %>% select(-popularity)) %>%
+  bind_cols(music_test %>% select(popularity)) %>%
+  popularity_metric(truth = popularity, estimate = .pred)
+```
+
+The random forest model applied to the testing data achieves an RMSE value of 11.7 and an R^2^ value of 0.554. These results are very similar to those found in the training data, and in fact only off by 0.1 in the RMSE metric. This suggests that the model did not overfit the training data. While the model did not fit the data as closely as I had hoped, since I am predicting something as subjective as popularity (which stems from the diverse tastes and preferences of a wide audience), I am quite happy with the results.
+
+<br>
+
+## Part V: Conclusion
+
+### Debrief
+
+At the start of this project, I began with an exploratory data analysis of the dataset in order to explore the outcome variable, `popularity`, and its relationship with several predictor variables. 
+
+Afterwards, I split the data into training and test sets and created folds using V-fold cross-validation resampling using five folds and three repeats. Then, I created a recipe to predict `popularity` using `acousticness`, `danceability`, `energy`, `instrumentalness`, `liveness`, `loudness`, `speechiness`, `tempo`, `valence`, `year`, `mode`, and `explicit`. This recipe was used for four models--elastic net, random forest, boosted tree, and nearest neighbors--that competed with each other based on the RMSE performance metric. 
+
+After tuning the parameters of each of the models, I determined the random forest model to be the best with parameters `mtry = 4` and `min_n = 2`. Applying the winning model to the testing data achieves an RMSE value of 11.7 and an R^2^ value of 0.554. Since popularity measures the unpredictable preferences of listeners, I am quite happy with the results of the model.
+
+<br>
+
+### Next Steps
+
+In terms of next steps, I believe additional data resources would certainly improve the accuracy of the model. In particular, finding additional data points on features such as genre may help explain some of the variance in the model. However, finding this information also presents an obstacle. For example, with genre, tracks often have multiple genres, and moreover, there exists subgenres. Therefore, genre would not be a mutually exclusive category and may be hard to characterize. Similar situations may arise with other characteristics of tracks. However, in any case, it would be worth putting in the effort to identify more characteristics.
+
+The minimial node size and number of randomly selected predictors both affected the performance of the model. In particular, I observed that the performance improves as the minimal node size decreases, and similarly, as the number of randomly selectors increases, the performance generally increases. However, changing these parameters levels off fairly quickly, and therefore, there may not be a need to adjust the parameters further.
+
+Finally, since the year played the biggest role in the model, the model raises the question of how music preferences change over time. Testing this question seems incredibly difficult, as I would have to analyze the number of listens a track has over time rather than at a cross-section of time. As such, data collection may be limited to a short period of time, since Spotify and its data has not existed for a long time. 
